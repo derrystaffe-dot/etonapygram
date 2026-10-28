@@ -1,0 +1,147 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ '**' ]
+    paths-ignore: [ '**.md' ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a GitHub release with the IPA'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    env:
+      # Source paths end up in the binary and in Bazel's cache keys, so keep them fixed.
+      SOURCE_DIR: /Users/Shared/telegram-ios
+      BAZEL_USER_ROOT: /private/var/tmp/_bazel_etonapygram
+      CACHE_DIR: /Users/Shared/telegram-bazel-cache
+
+    steps:
+      - name: Checkout etonapygram
+        uses: actions/checkout@v4
+
+      - name: Read pinned Telegram commit
+        run: echo "TELEGRAM_COMMIT=$(tr -d '[:space:]' < TELEGRAM_COMMIT)" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          # Only Xcode 27.1 is needed (see versions.json in Telegram-iOS).
+          for app in /Applications/Xcode_*.app; do
+            case "$(basename "$app")" in
+              Xcode_27.1.app|Xcode_27.1.0.app) ;;
+              *) [ -L "$app" ] || sudo rm -rf "$app" ;;
+            esac
+          done
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet || true
+          df -h /
+
+      - name: Checkout Telegram-iOS
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users/Shared
+          sudo chown "$(whoami)" /Users/Shared
+          git init -q "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch -q --depth 1 origin "$TELEGRAM_COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --depth 1 --jobs 8 \
+            || git submodule update --init --recursive --jobs 8
+
+      - name: Apply etonapygram
+        run: scripts/apply.sh "$SOURCE_DIR"
+
+      - name: Write build configuration
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          if [ -z "${TG_API_ID:-}" ] || [ -z "${TG_API_HASH:-}" ]; then
+            echo "::warning::TG_API_ID / TG_API_HASH secrets are not set, using the api_id from Telegram's own configuration. Get your own at https://my.telegram.org/apps."
+          fi
+          python3 - <<'PY'
+          import json, os
+          with open('build-system/appstore-configuration.json') as f:
+              config = json.load(f)
+          if os.environ.get('TG_API_ID') and os.environ.get('TG_API_HASH'):
+              config['api_id'] = os.environ['TG_API_ID']
+              config['api_hash'] = os.environ['TG_API_HASH']
+          # The rest matches the fake-codesigning profiles, so it stays as Telegram ships it.
+          with open('build-system/etonapygram-configuration.json', 'w') as f:
+              json.dump(config, f, indent=2)
+          PY
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: bazel-${{ env.TELEGRAM_COMMIT }}-${{ hashFiles('mod/**', 'patches/**') }}
+          restore-keys: |
+            bazel-${{ env.TELEGRAM_COMMIT }}-
+            bazel-
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+
+          APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')
+          BUILD_NUMBER=$(( $(cat build_number_offset) + ${{ github.run_number }} ))
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$CACHE_DIR" \
+            build \
+            --configurationPath=build-system/etonapygram-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build"
+
+          mv "$GITHUB_WORKSPACE/build/Telegram.ipa" "$GITHUB_WORKSPACE/build/etonapygram.ipa"
+          ls -la "$GITHUB_WORKSPACE/build"
+
+      - name: Save Bazel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: bazel-${{ env.TELEGRAM_COMMIT }}-${{ hashFiles('mod/**', 'patches/**') }}-${{ github.run_id }}
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: etonapygram-${{ env.APP_VERSION }}-${{ env.BUILD_NUMBER }}
+          path: build/etonapygram.ipa
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.BUILD_NUMBER }}
+          name: etonapygram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
+          body: |
+            etonapygram, based on Telegram iOS ${{ env.APP_VERSION }}.
+            The IPA is signed with a self-signed certificate: re-sign it with Sideloadly, AltStore, ESign or install with TrollStore.
+          files: build/etonapygram.ipa
