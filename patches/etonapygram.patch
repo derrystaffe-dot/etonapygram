@@ -1,0 +1,396 @@
+diff --git a/submodules/TelegramCore/BUILD b/submodules/TelegramCore/BUILD
+index d4ed7767..09f698f7 100644
+--- a/submodules/TelegramCore/BUILD
++++ b/submodules/TelegramCore/BUILD
+@@ -30,6 +30,7 @@ swift_library(
+         "//submodules/TelegramCore/FlatBuffers",
+         "//submodules/TelegramCore/FlatSerialization",
+         "//submodules/MurMurHash32",
++        "//submodules/EtonaSettings:EtonaSettings",
+     ],
+     visibility = [
+         "//visibility:public",
+diff --git a/submodules/TelegramCore/Sources/Account/AccountManager.swift b/submodules/TelegramCore/Sources/Account/AccountManager.swift
+index bf906980..b05e9d37 100644
+--- a/submodules/TelegramCore/Sources/Account/AccountManager.swift
++++ b/submodules/TelegramCore/Sources/Account/AccountManager.swift
+@@ -104,6 +104,7 @@ private var declaredEncodables: Void = {
+     declareEncodable(InlineBotMessageAttribute.self, f: { InlineBotMessageAttribute(decoder: $0) })
+     declareEncodable(InlineBusinessBotMessageAttribute.self, f: { InlineBusinessBotMessageAttribute(decoder: $0) })
+     declareEncodable(TextEntitiesMessageAttribute.self, f: { TextEntitiesMessageAttribute(decoder: $0) })
++    declareEncodable(EtonaMessageAttribute.self, f: { EtonaMessageAttribute(decoder: $0) })
+     declareEncodable(RichTextMessageAttribute.self, f: { RichTextMessageAttribute(decoder: $0) })
+     declareEncodable(ReplyMessageAttribute.self, f: { ReplyMessageAttribute(decoder: $0) })
+     declareEncodable(QuotedReplyMessageAttribute.self, f: { QuotedReplyMessageAttribute(decoder: $0) })
+diff --git a/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift b/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
+index 3d99e59d..01fff477 100644
+--- a/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
++++ b/submodules/TelegramCore/Sources/State/AccountStateManagementUtils.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import EtonaSettings
+ import Postbox
+ import SwiftSignalKit
+ internal import TelegramApi
+@@ -4621,7 +4622,13 @@ func replayFinalState(
+                 upsertEphemeralReplacement(transaction: transaction, anchorMessageId: anchorMessageId, message: message)
+             case let .DeleteEphemeralMessages(peerId, ids):
+                 deleteEphemeralMessages(transaction: transaction, peerId: peerId, ids: ids)
+-            case let .DeleteMessagesWithGlobalIds(ids):
++            case var .DeleteMessagesWithGlobalIds(ids):
++                if EtonaSettings.shared.saveDeletedMessages {
++                    let messageIds = transaction.messageIdsForGlobalIds(ids)
++                    let remainingIds = Set(etonaKeepDeletedMessages(transaction: transaction, ids: messageIds))
++                    let keptGlobalIds = Set(messageIds.filter { !remainingIds.contains($0) }.map { $0.id })
++                    ids = ids.filter { !keptGlobalIds.contains($0) }
++                }
+                 var resourceIds: [MediaResourceId] = []
+                 transaction.deleteMessagesWithGlobalIds(ids, forEachMedia: { media in
+                     addMessageMediaResourceIdsToRemove(media: media, resourceIds: &resourceIds)
+@@ -4630,7 +4637,8 @@ func replayFinalState(
+                     let _ = mediaBox.removeCachedResources(Array(Set(resourceIds)), force: true).start()
+                 }
+                 deletedMessageIds.append(contentsOf: ids.map { .global($0) })
+-            case let .DeleteMessages(ids):
++            case var .DeleteMessages(ids):
++                ids = etonaKeepDeletedMessages(transaction: transaction, ids: ids)
+                 _internal_deleteMessages(transaction: transaction, mediaBox: mediaBox, ids: ids, manualAddMessageThreadStatsDifference: { id, add, remove in
+                     addMessageThreadStatsDifference(threadKey: id, remove: remove, addedMessagePeer: nil, addedMessageId: nil, isOutgoing: false)
+                 })
+@@ -4680,7 +4688,7 @@ func replayFinalState(
+                         generatedEvent = reactionGeneratedEvent(previousMessage.reactionsAttribute, message.reactionsAttribute, message: message, transaction: transaction)
+                     }
+                     
+-                    return .update(mergedServerMessageUpdate(previous: previousMessage, updated: message))
++                    return .update(etonaRecordEdit(previous: previousMessage, updated: mergedServerMessageUpdate(previous: previousMessage, updated: message)))
+                 })
+                 if let generatedEvent = generatedEvent {
+                     addedReactionEvents.append(generatedEvent)
+diff --git a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+index 7256668b..5a241ac8 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+@@ -3,6 +3,7 @@ internal import TelegramApi
+ import Postbox
+ import SwiftSignalKit
+ import MtProtoKit
++import EtonaSettings
+ 
+ private typealias SignalKitTimer = SwiftSignalKit.Timer
+ 
+@@ -53,7 +54,8 @@ private final class AccountPresenceManagerImpl {
+             }, queue: self.queue)
+             self.onlineTimer = timer
+             timer.start()
+-            request = self.network.request(Api.functions.account.updateStatus(offline: .boolFalse))
++            // Ghost mode: keep the timer so the real status comes back once the switch is off.
++            request = self.network.request(Api.functions.account.updateStatus(offline: EtonaSettings.shared.hideOnline ? .boolTrue : .boolFalse))
+         } else {
+             self.onlineTimer?.invalidate()
+             self.onlineTimer = nil
+diff --git a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+index e8e08874..dbf4c761 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+@@ -147,6 +147,9 @@ private func requestActivity(postbox: Postbox, network: Network, accountPeerId:
+             if peerId == accountPeerId {
+                 return .complete()
+             }
++            if etonaShouldHideActivity(activity, peerId: peerId) {
++                return .complete()
++            }
+             if let channel = peer as? TelegramChannel, case .broadcast = channel.info {
+                 if let activity = activity {
+                     switch activity {
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+index b5ede6a8..d8c7c5e0 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+@@ -110,6 +110,9 @@ func managedSynchronizeConsumeMessageContentOperations(postbox: Postbox, network
+ }
+ 
+ private func synchronizeConsumeMessageContents(transaction: Transaction, network: Network, stateManager: AccountStateManager, peerId: PeerId, operation: SynchronizeConsumeMessageContentsOperation) -> Signal<Void, NoError> {
++    if etonaHideListened(peerId: peerId) {
++        return .complete()
++    }
+     if peerId.namespace == Namespaces.Peer.CloudUser || peerId.namespace == Namespaces.Peer.CloudGroup {
+         return network.request(Api.functions.messages.readMessageContents(id: operation.messageIds.map { $0.id }))
+         |> map(Optional.init)
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+index e38c0f96..fc5fd587 100644
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+@@ -119,6 +119,9 @@ func managedSynchronizeViewStoriesOperations(postbox: Postbox, network: Network,
+ }
+ 
+ private func pushStoriesAreSeen(postbox: Postbox, network: Network, stateManager: AccountStateManager, peer: Peer, operation: SynchronizeViewStoriesOperation) -> Signal<Void, NoError> {
++    if etonaAnonymousStories(peerId: peer.id) {
++        return .complete()
++    }
+     guard let inputPeer = apiInputPeer(peer) else {
+         return .complete()
+     }
+diff --git a/submodules/TelegramCore/Sources/State/ServerMessageMerge.swift b/submodules/TelegramCore/Sources/State/ServerMessageMerge.swift
+index 7c455601..21cd2b8c 100644
+--- a/submodules/TelegramCore/Sources/State/ServerMessageMerge.swift
++++ b/submodules/TelegramCore/Sources/State/ServerMessageMerge.swift
+@@ -9,7 +9,7 @@ import Postbox
+ func mergedServerMessageUpdate(previous previousMessage: Message, updated message: StoreMessage) -> StoreMessage {
+     var updatedFlags = message.flags
+     var updatedLocalTags = message.localTags
+-    var updatedAttributes = message.attributes
++    var updatedAttributes = etonaCarryOverAttribute(previous: previousMessage, updated: message.attributes)
+     if previousMessage.localTags.contains(.OutgoingLiveLocation) {
+         updatedLocalTags.insert(.OutgoingLiveLocation)
+     }
+diff --git a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+index b2e65895..42910e1b 100644
+--- a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
++++ b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+@@ -431,7 +431,9 @@ func synchronizePeerReadState(network: Network, postbox: Postbox, stateManager:
+     // without going through the interactive read (a support account's send, the chat list's
+     // read toggle, operations persisted by earlier builds).
+     let keepsReadState = postbox.transaction { transaction -> Bool in
+-        return peerKeepsReadState(transaction.getPeer(peerId))
++        // Ghost mode: nothing is pushed, and validation is skipped too, since the server's
++        // read mark now trails the local one on purpose and validation would retry forever.
++        return peerKeepsReadState(transaction.getPeer(peerId)) && !etonaHideReadReceipts(peerId: peerId)
+     }
+     |> castError(PeerReadStateValidationError.self)
+ 
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift
+index 041f0e62..8004eb22 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift
+@@ -219,11 +219,11 @@ func _internal_toggleForumThreadUnreadMarkInteractively(transaction: Transaction
+             
+             if peer.isForum {
+                 if let inputPeer = apiInputPeer(peer) {
+-                    let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start()
++                    if !etonaHideReadReceipts(peerId: peerId) { let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start() }
+                 }
+             } else if peer.isMonoForum {
+                 if let inputPeer = apiInputPeer(peer), let subPeer = transaction.getPeer(PeerId(threadId)).flatMap(apiInputPeer) {
+-                    let _ = network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeer, maxId: messageIndex.id.id)).start()
++                    if !etonaHideReadReceipts(peerId: peerId) { let _ = network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeer, maxId: messageIndex.id.id)).start() }
+                 }
+             }
+         }
+@@ -255,11 +255,11 @@ func _internal_markForumThreadAsReadInteractively(transaction: Transaction, netw
+         
+         if peer.isForum {
+             if let inputPeer = apiInputPeer(peer) {
+-                let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start()
++                if !etonaHideReadReceipts(peerId: peerId) { let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start() }
+             }
+         } else if peer.isMonoForum {
+             if let inputPeer = apiInputPeer(peer), let subPeer = transaction.getPeer(PeerId(threadId)).flatMap(apiInputPeer) {
+-                let _ = network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeer, maxId: messageIndex.id.id)).start()
++                if !etonaHideReadReceipts(peerId: peerId) { let _ = network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeer, maxId: messageIndex.id.id)).start() }
+             }
+         }
+     }
+@@ -297,11 +297,11 @@ func _internal_togglePeerUnreadMarkInteractively(transaction: Transaction, netwo
+                 
+                 if peer.isForum {
+                     if let inputPeer = apiInputPeer(peer) {
+-                        let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: item.threadId), readMaxId: messageIndex.id.id)).start()
++                        if !etonaHideReadReceipts(peerId: peerId) { let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: item.threadId), readMaxId: messageIndex.id.id)).start() }
+                     }
+                 } else if peer.isMonoForum {
+                     if let inputPeer = apiInputPeer(peer), let subPeer = transaction.getPeer(PeerId(item.threadId)).flatMap(apiInputPeer) {
+-                        let _ = network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeer, maxId: messageIndex.id.id)).start()
++                        if !etonaHideReadReceipts(peerId: peerId) { let _ = network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeer, maxId: messageIndex.id.id)).start() }
+                     }
+                 }
+             }
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift
+index 5c0a9101..b4cf497f 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift
+@@ -477,6 +477,9 @@ private class ReplyThreadHistoryContextImpl {
+                 }
+             }
+ 
++            if etonaHideReadReceipts(peerId: peerId) {
++                return
++            }
+             if let subPeerId {
+                 let signal = strongSelf.account.network.request(Api.functions.messages.readSavedHistory(parentPeer: inputPeer, peer: subPeerId, maxId: messageIndex.id.id))
+                 |> `catch` { _ -> Signal<Api.Bool, NoError> in
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/Stories.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/Stories.swift
+index 9878c79e..11a4e4a4 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/Stories.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/Stories.swift
+@@ -2086,6 +2086,9 @@ func _internal_markStoryAsSeen(account: Account, peerId: PeerId, id: Int32, asPi
+             }
+             #endif
+             
++            if etonaAnonymousStories(peerId: peerId) {
++                return .complete()
++            }
+             return account.network.request(Api.functions.stories.incrementStoryViews(peer: inputPeer, id: [id]))
+             |> `catch` { _ -> Signal<Api.Bool, NoError> in
+                 return .single(.boolFalse)
+diff --git a/submodules/TelegramUI/BUILD b/submodules/TelegramUI/BUILD
+index 75245702..75589b3f 100644
+--- a/submodules/TelegramUI/BUILD
++++ b/submodules/TelegramUI/BUILD
+@@ -440,6 +440,8 @@ swift_library(
+         "//submodules/MetalEngine",
+         "//submodules/TelegramUI/Components/DustEffect",
+         "//submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen",
++        "//submodules/EtonaSettings:EtonaSettings",
++        "//submodules/EtonaSettingsUI:EtonaSettingsUI",
+         "//submodules/TelegramUI/Components/Chat/ChatMessageSelectionInputPanelNode",
+         "//submodules/TelegramUI/Components/Chat/ChatQrCodeScreen",
+         "//submodules/TelegramUI/Components/QrStudioScreen",
+diff --git a/submodules/TelegramUI/Components/Chat/ChatMessageDateAndStatusNode/Sources/StringForMessageTimestampStatus.swift b/submodules/TelegramUI/Components/Chat/ChatMessageDateAndStatusNode/Sources/StringForMessageTimestampStatus.swift
+index ad79b915..b5105cab 100644
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageDateAndStatusNode/Sources/StringForMessageTimestampStatus.swift
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageDateAndStatusNode/Sources/StringForMessageTimestampStatus.swift
+@@ -111,6 +111,10 @@ public func stringForMessageTimestampStatus(
+     if timestamp == scheduleWhenOnlineTimestamp {
+         dateText = "         "
+     }
++    if message.etonaIsDeleted {
++        // etonapygram: deleted on the server, kept on this device.
++        dateText = "🗑 " + dateText
++    }
+     
+     if let repeatPeriod = message.scheduleRepeatPeriod {
+         let repeatString: String
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
+index 0ca07f27..0eff74f1 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/BUILD
+@@ -10,6 +10,8 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/EtonaSettings:EtonaSettings",
++        "//submodules/EtonaSettingsUI:EtonaSettingsUI",
+         "//submodules/UrlWhitelist",
+         "//submodules/TelegramUI/Components/NavigationBarNode",
+         "//submodules/TelegramUI/Components/NavigationBarComponent",
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift
+index fdc996cb..53100a11 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift
+@@ -1270,7 +1270,7 @@ final class PeerInfoHeaderNode: ASDisplayNode {
+             smallTitleAttributes = MultiScaleTextState.Attributes(font: Font.medium(28.0), color: .white, shadowColor: titleShadowColor)
+             
+             if self.isSettings, case let .user(user) = peer {
+-                var subtitle = formatPhoneNumber(context: self.context, number: user.phone ?? "")
++                var subtitle = etonaMaskedPhoneNumber(formatPhoneNumber(context: self.context, number: user.phone ?? ""))
+                 
+                 if let mainUsername = user.addressName, !mainUsername.isEmpty {
+                     subtitle = "\(subtitle) • @\(mainUsername)"
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+index 34f23770..2e50f4e3 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoProfileItems.swift
+@@ -181,7 +181,8 @@ func infoItems(
+             } else {
+                 label = presentationData.strings.ContactInfo_PhoneLabelMobile
+             }
+-            items[currentPeerInfoSection]!.append(PeerInfoScreenLabeledValueItem(id: ItemPhoneNumber, label: label, text: formattedPhone, textColor: .accent, action: { node, progress in
++            let phoneEntities = etonaPhoneSpoilerEntities(text: formattedPhone, isOwnNumber: user.id == context.account.peerId)
++            items[currentPeerInfoSection]!.append(PeerInfoScreenLabeledValueItem(id: ItemPhoneNumber, label: label, text: formattedPhone, entities: phoneEntities, handleSpoilers: !phoneEntities.isEmpty, textColor: .accent, action: { node, progress in
+                 interaction.openPhone(phone, node, nil, progress)
+             }, longTapAction: nil, contextAction: { node, gesture, _ in
+                 interaction.openPhone(phone, node, gesture, nil)
+@@ -845,6 +846,10 @@ func infoItems(
+         }
+     }
+     
++    if let peer = data.peer {
++        items[currentPeerInfoSection]!.append(contentsOf: etonaPeerInfoItems(peer: peer, presentationData: presentationData, interaction: interaction))
++    }
++
+     if let peer = data.peer, let members = data.members, case let .shortList(_, memberList) = members {
+         var canAddMembers = false
+         if case let .legacyGroup(group) = data.peer {
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+index 8c4a24b7..0dafc79e 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreen.swift
+@@ -197,6 +197,7 @@ enum PeerInfoSettingsSection {
+     case stars
+     case ton
+     case wallet
++    case etonapygram
+ }
+ 
+ enum PeerInfoReportType {
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenSettingsActions.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenSettingsActions.swift
+index f1c1917b..2291b3fe 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenSettingsActions.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoScreenSettingsActions.swift
+@@ -17,6 +17,7 @@ import PasswordSetupUI
+ import InstantPageCache
+ import WalletContext
+ import UndoUI
++import EtonaSettingsUI
+ 
+ extension PeerInfoScreenNode {
+     func openSettings(section: PeerInfoSettingsSection) {
+@@ -307,6 +308,8 @@ extension PeerInfoScreenNode {
+                 return
+             }
+             push(self.context.sharedContext.makeWalletScreen(context: self.context))
++        case .etonapygram:
++            push(etonaSettingsController(context: self.context))
+         }
+     }
+ 
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoSettingsItems.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoSettingsItems.swift
+index a4873696..b244d7b5 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoSettingsItems.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoSettingsItems.swift
+@@ -13,6 +13,7 @@ import DeviceAccess
+ import TelegramStringFormatting
+ import PeerNameColorItem
+ import WalletContext
++import EtonaSettingsUI
+ 
+ enum SettingsSection: Int, CaseIterable {
+     case edit
+@@ -253,6 +254,9 @@ func settingsItems(data: PeerInfoScreenData?, context: AccountContext, presentat
+     } else {
+         notificationsWarning = false
+     }
++    items[.advanced]!.append(PeerInfoScreenDisclosureItem(id: 99, text: etonaStrings(presentationData.strings).entryTitle, icon: etonaSettingsIcon, action: {
++        interaction.openSettings(.etonapygram)
++    }))
+     items[.advanced]!.append(PeerInfoScreenDisclosureItem(id: 0, label: notificationsWarning ? .badge("!", presentationData.theme.list.itemDestructiveColor) : .none, text: presentationData.strings.Settings_NotificationsAndSounds, icon: PresentationResourcesSettings.notifications, action: {
+         interaction.openSettings(.notificationsAndSounds)
+     }))
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+index 1ade8c01..6b05d585 100644
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -39,6 +39,7 @@ import ChatMessageBubbleItemNode
+ import AdsInfoScreen
+ import AdsReportScreen
+ import WalletContext
++import EtonaSettingsUI
+  
+ private struct MessageContextMenuData {
+     let starStatus: Bool?
+@@ -1347,6 +1348,15 @@ func contextMenuForChatPresentationInterfaceState(chatPresentationInterfaceState
+             }
+         }
+         
++        if !message.etonaEditHistory.isEmpty {
++            actions.append(.action(ContextMenuActionItem(text: etonaStrings(chatPresentationInterfaceState.strings).editHistoryAction, icon: { theme in
++                return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Edit"), color: theme.actionSheet.primaryTextColor)
++            }, action: { _, f in
++                f(.dismissWithoutContent)
++                controllerInteraction.navigationController()?.pushViewController(etonaEditHistoryController(context: context, message: EngineMessage(message)))
++            })))
++        }
++
+         let isCopyProtected = chatPresentationInterfaceState.copyProtectionEnabled || message.isCopyProtected()
+         if !messageText.isEmpty || richMessageMarkdown != nil || (resourceAvailable && isImage) || diceEmoji != nil {
+             if !isExpired {
