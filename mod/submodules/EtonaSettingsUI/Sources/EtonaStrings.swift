@@ -37,6 +37,9 @@ public struct EtonaStrings {
     let saveDeletedMessages: String
     let saveEditHistory: String
     let chatsFooter: String
+    let readAll: String
+    let readAllConfirmation: String
+    let readAllConfirm: String
 
     public let deletedMark: String
     public let editHistoryAction: String
@@ -75,6 +78,9 @@ public struct EtonaStrings {
         saveDeletedMessages: "Сохранять удалённые сообщения",
         saveEditHistory: "Сохранять историю изменений",
         chatsFooter: "Удалённые сообщения остаются в чате с пометкой. Старые версии изменённых сообщений видны в меню сообщения.",
+        readAll: "Прочитать все сообщения",
+        readAllConfirmation: "Отметить все чаты, включая архив, как прочитанные? Со скрытым прочтением собеседники этого не увидят.",
+        readAllConfirm: "Прочитать",
         deletedMark: "удалено",
         editHistoryAction: "История изменений",
         editHistoryTitle: "История изменений",
@@ -113,6 +119,9 @@ public struct EtonaStrings {
         saveDeletedMessages: "Keep Deleted Messages",
         saveEditHistory: "Keep Edit History",
         chatsFooter: "Deleted messages stay in the chat with a mark. Earlier versions of edited messages are in the message menu.",
+        readAll: "Read All Messages",
+        readAllConfirmation: "Mark every chat, including the archive, as read? With read receipts hidden, nobody will see it.",
+        readAllConfirm: "Read",
         deletedMark: "deleted",
         editHistoryAction: "Edit History",
         editHistoryTitle: "Edit History",

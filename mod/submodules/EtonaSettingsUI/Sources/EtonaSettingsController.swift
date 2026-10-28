@@ -16,6 +16,7 @@ private final class EtonaSettingsControllerArguments {
     let toggle: (EtonaSettings.Key, Bool) -> Void
     let addException: () -> Void
     let removeException: (EnginePeer.Id) -> Void
+    let readAll: () -> Void
     let setPeerIdWithRevealedOptions: (EnginePeer.Id?, EnginePeer.Id?) -> Void
 
     init(
@@ -23,12 +24,14 @@ private final class EtonaSettingsControllerArguments {
         toggle: @escaping (EtonaSettings.Key, Bool) -> Void,
         addException: @escaping () -> Void,
         removeException: @escaping (EnginePeer.Id) -> Void,
+        readAll: @escaping () -> Void,
         setPeerIdWithRevealedOptions: @escaping (EnginePeer.Id?, EnginePeer.Id?) -> Void
     ) {
         self.context = context
         self.toggle = toggle
         self.addException = addException
         self.removeException = removeException
+        self.readAll = readAll
         self.setPeerIdWithRevealedOptions = setPeerIdWithRevealedOptions
     }
 }
@@ -55,6 +58,7 @@ private enum EtonaSettingsEntry: ItemListNodeEntry {
 
     case chatsHeader(String)
     case chatsFooter(String)
+    case readAll(String)
 
     var section: ItemListSectionId {
         switch self {
@@ -66,7 +70,7 @@ private enum EtonaSettingsEntry: ItemListNodeEntry {
             return EtonaSettingsSection.exceptions.rawValue
         case .profileHeader, .profileFooter:
             return EtonaSettingsSection.profile.rawValue
-        case .chatsHeader, .chatsFooter:
+        case .chatsHeader, .chatsFooter, .readAll:
             return EtonaSettingsSection.chats.rawValue
         }
     }
@@ -94,6 +98,8 @@ private enum EtonaSettingsEntry: ItemListNodeEntry {
         case .chatsHeader:
             return 4000
         case .chatsFooter:
+            return 4998
+        case .readAll:
             return 4999
         }
     }
@@ -122,6 +128,8 @@ private enum EtonaSettingsEntry: ItemListNodeEntry {
             if case .chatsHeader(text) = rhs { return true } else { return false }
         case let .chatsFooter(text):
             if case .chatsFooter(text) = rhs { return true } else { return false }
+        case let .readAll(text):
+            if case .readAll(text) = rhs { return true } else { return false }
         }
     }
 
@@ -139,6 +147,10 @@ private enum EtonaSettingsEntry: ItemListNodeEntry {
         case let .toggle(_, _, key, title, value, enabled):
             return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: title, value: value, enabled: enabled, maximumNumberOfLines: 2, sectionId: self.section, style: .blocks, updated: { value in
                 arguments.toggle(key, value)
+            })
+        case let .readAll(text):
+            return ItemListActionItem(presentationData: presentationData, systemStyle: .glass, title: text, kind: .generic, alignment: .natural, sectionId: self.section, style: .blocks, action: {
+                arguments.readAll()
             })
         case let .addException(text):
             return ItemListPeerActionItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesItemList.addPersonIcon(presentationData.theme), title: text, sectionId: self.section, height: .generic, editing: false, action: {
@@ -205,6 +217,7 @@ private func etonaSettingsEntries(strings s: EtonaStrings, state: EtonaSettingsS
     entries.append(.toggle(index: 0, section: .chats, key: .saveDeletedMessages, title: s.saveDeletedMessages, value: settings.saveDeletedMessages, enabled: true))
     entries.append(.toggle(index: 1, section: .chats, key: .saveEditHistory, title: s.saveEditHistory, value: settings.saveEditHistory, enabled: true))
     entries.append(.chatsFooter(s.chatsFooter))
+    entries.append(.readAll(s.readAll))
 
     return entries
 }
@@ -224,6 +237,7 @@ public func etonaSettingsController(context: AccountContext) -> ViewController {
     }
 
     var pushControllerImpl: ((ViewController) -> Void)?
+    var presentControllerImpl: ((ViewController) -> Void)?
 
     let arguments = EtonaSettingsControllerArguments(
         context: context,
@@ -246,6 +260,16 @@ public func etonaSettingsController(context: AccountContext) -> ViewController {
                 state.version += 1
                 state.peerIdWithRevealedOptions = nil
             }
+        },
+        readAll: {
+            let presentationData = context.sharedContext.currentPresentationData.with { $0 }
+            let strings = etonaStrings(presentationData.strings)
+            presentControllerImpl?(textAlertController(context: context, title: nil, text: strings.readAllConfirmation, actions: [
+                TextAlertAction(type: .genericAction, title: presentationData.strings.Common_Cancel, action: {}),
+                TextAlertAction(type: .defaultAction, title: strings.readAllConfirm, action: {
+                    let _ = context.engine.messages.markAllChatsAsReadInteractively(items: [(groupId: .root, filterPredicate: nil), (groupId: .archive, filterPredicate: nil)]).startStandalone()
+                })
+            ]))
         },
         setPeerIdWithRevealedOptions: { previousId, id in
             updateState { state in
@@ -288,6 +312,9 @@ public func etonaSettingsController(context: AccountContext) -> ViewController {
     let controller = ItemListController(context: context, state: signal)
     pushControllerImpl = { [weak controller] c in
         controller?.push(c)
+    }
+    presentControllerImpl = { [weak controller] c in
+        controller?.present(c, in: .window(.root))
     }
     return controller
 }
